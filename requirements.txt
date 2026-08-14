@@ -1,0 +1,6 @@
+python-telegram-bot[job-queue]
+yfinance
+pandas
+pytz
+pillow
+pytesseract
