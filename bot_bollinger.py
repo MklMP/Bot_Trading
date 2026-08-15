@@ -13,6 +13,7 @@ from io import BytesIO
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, ContextTypes
+
 import pytz
 import yfinance as yf
 import pandas as pd
@@ -83,7 +84,7 @@ TICKERS = {
     "NVDA": "NVDA",
     "TSLA": "TSLA",
     "AMD": "AMD",
-    "GOOG": "GOOGL",
+    "GOOG": "GOOG",
     "AAPL": "AAPL",
     "MSFT": "MSFT",
     "AMZN": "AMZN",
@@ -91,7 +92,7 @@ TICKERS = {
     "NAS100": "^NDX",
 }
 
-INTERVALO = "5m"
+INTERVALO = "15m"
 PERIODO = "1d"
 HORA_INICIO_BOLLINGER = time(7, 30)
 HORA_FIN_BOLLINGER = time(11, 30)
@@ -552,14 +553,20 @@ def preprocesar_imagen(img: Image.Image) -> Image.Image:
     img = ImageOps.autocontrast(img)
     return img
 
-async def journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = "https://trading-journal-1iiz.onrender.com"  # ← Reemplaza por tu URL real
+
     teclado = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📒 Abrir Journal", web_app=WebAppInfo(url="https://trading-journal-1iiz.onrender.com"))]
+        [InlineKeyboardButton("📒 Abrir Journal", web_app=WebAppInfo(url=url))]
     ])
-    await update.message.reply_text(
-        "Toca el botón para abrir tu journal de trading:",
-        reply_markup=teclado
-    )
+
+    try:
+        await update.message.reply_text(
+            "Toca el botón para abrir tu journal:",
+            reply_markup=teclado
+        )
+    except Exception as e:
+        print(f"Error enviando journal: {e}")
+
 # ══════════════════════════════════════════════════════════
 # PROCESAMIENTO DE IMÁGENES
 # Solo responde cuando detecta un resultado de operación real.
