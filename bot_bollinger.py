@@ -11,7 +11,8 @@ from contextlib import closing
 from datetime import datetime, time, timedelta
 from io import BytesIO
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.ext import Application, CommandHandler, ContextTypes
 import pytz
 import yfinance as yf
 import pandas as pd
@@ -551,7 +552,14 @@ def preprocesar_imagen(img: Image.Image) -> Image.Image:
     img = ImageOps.autocontrast(img)
     return img
 
-
+async def journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📒 Abrir Journal", web_app=WebAppInfo(url="https://trading-journal-1iiz.onrender.com"))]
+    ])
+    await update.message.reply_text(
+        "Toca el botón para abrir tu journal de trading:",
+        reply_markup=teclado
+    )
 # ══════════════════════════════════════════════════════════
 # PROCESAMIENTO DE IMÁGENES
 # Solo responde cuando detecta un resultado de operación real.
@@ -1132,7 +1140,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje_texto))
     app.add_handler(MessageHandler(filters.PHOTO, procesar_imagen))
     app.add_handler(MessageHandler(filters.Document.FileExtension("db"), comando_restore))
-
+    app.add_handler(CommandHandler("journal", journal))
     # Errores
     app.add_error_handler(manejador_errores)
 
