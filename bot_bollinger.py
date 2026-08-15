@@ -7,7 +7,7 @@ from datetime import datetime, time, timedelta
 from io import BytesIO
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-
+import platform
 import pytz
 import yfinance as yf
 import pandas as pd
@@ -39,6 +39,26 @@ if not TOKEN:
     raise ValueError("Falta la variable de entorno TELEGRAM_BOT_TOKEN")
 if CHAT_ID == 0:
     raise ValueError("Falta la variable de entorno TELEGRAM_CHAT_ID")
+
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/ocr":
+            try:
+                version = pytesseract.get_tesseract_version()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(f"Tesseract version: {version}".encode())
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"Error: {e}".encode())
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
 
 TICKERS = {
     "NVDA": "NVDA",
@@ -81,6 +101,7 @@ SALUDOS_VIERNES = [
     "Se acabó la semana. Aprendamos de los resultados. 📚"
 ]
 
+            
 # ══════════════════════════════════════════════════════════
 # ALMACENAMIENTO SEMANAL
 # ══════════════════════════════════════════════════════════
@@ -891,9 +912,16 @@ def main():
     # Iniciar servidor HTTP para health check (Render)
     start_health_server()
 
-    # Si Tesseract no está en PATH local, descomenta y ajusta:
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    
 
+   try:
+        if platform.system() == "Windows":
+            pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        else:
+            pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
+    except Exception as e:
+        print(f"⚠️ No se pudo configurar Tesseract: {e}")
+        
     app = (
         Application.builder()
         .token(TOKEN)
