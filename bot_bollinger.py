@@ -912,15 +912,12 @@ def main():
     # Iniciar servidor HTTP para health check (Render)
     start_health_server()
 
-    
-
-   try:
-        if platform.system() == "Windows":
-            pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-        else:
-            pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-    except Exception as e:
-        print(f"⚠️ No se pudo configurar Tesseract: {e}")
+    # Configurar ruta de Tesseract según el sistema operativo
+    if platform.system() == "Windows":
+        pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    else:
+        # En Linux (Render) Tesseract está en /usr/bin/tesseract
+        pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
         
     app = (
         Application.builder()
