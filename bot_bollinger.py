@@ -12,6 +12,8 @@ from datetime import datetime, time, timedelta
 from io import BytesIO
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram.constants import ChatAction
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import pytz
@@ -92,8 +94,8 @@ TICKERS = {
     "NAS100": "^NDX",
 }
 
-INTERVALO = "15m"
-PERIODO = "1d"
+INTERVALOS_ESCANEO = ["5m", "15m"]  # Bollinger se evalúa en ambas temporalidades
+PERIODO_ESCANEO = "5d"  # suficiente historial para EMA50/RSI/MACD estables en ambos intervalos
 HORA_INICIO_BOLLINGER = time(7, 30)
 HORA_FIN_BOLLINGER = time(11, 30)
 NY_TZ = pytz.timezone("America/New_York")
@@ -313,44 +315,252 @@ def es_duplicado(usuario, profit, capital, fuente, ventana_seg=300):
 # ══════════════════════════════════════════════════════════
 # ESCANEO DE BANDAS DE BOLLINGER
 # ══════════════════════════════════════════════════════════
+def es_dia_habil():
+    """Lunes a viernes en horario de Nueva York. Sábado y domingo el mercado está cerrado."""
+    return datetime.now(NY_TZ).weekday() < 5  # 0=lunes ... 4=viernes, 5=sábado, 6=domingo
+
+
 def dentro_horario_bollinger():
     hora_actual = datetime.now(NY_TZ).time()
     return HORA_INICIO_BOLLINGER <= hora_actual <= HORA_FIN_BOLLINGER
 
 
+def mercado_activo():
+    """True solo si es día hábil Y estamos dentro del horario de escaneo."""
+    return es_dia_habil() and dentro_horario_bollinger()
+
+
+# ══════════════════════════════════════════════════════════
+# ANÁLISIS TÉCNICO — EMAs, RSI, MACD y volumen (OBV)
+# Actúa como capa de "analista profesional" que confirma o
+# descarta la señal de ruptura de Bollinger.
+# ══════════════════════════════════════════════════════════
+def calcular_indicadores(df):
+    """Calcula EMAs (9/21/50), RSI(14), MACD(12,26,9) y OBV sobre el DataFrame."""
+    df = df.copy()
+
+    df["EMA9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["EMA21"] = df["Close"].ewm(span=21, adjust=False).mean()
+    df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
+    delta = df["Close"].diff()
+    ganancia = delta.clip(lower=0)
+    perdida = -delta.clip(upper=0)
+    avg_gain = ganancia.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = perdida.ewm(alpha=1 / 14, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["MACD"] = ema12 - ema26
+    df["MACD_signal"] = df["MACD"].ewm(span=9, adjust=False).mean()
+    df["MACD_hist"] = df["MACD"] - df["MACD_signal"]
+
+    if "Volume" in df.columns:
+        direccion = df["Close"].diff().apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+        df["OBV"] = (direccion * df["Volume"]).fillna(0).cumsum()
+    else:
+        df["OBV"] = 0.0
+
+    return df
+
+
+def interpretar_tecnico(df, ventana_obv=10):
+    """
+    Lee el estado técnico actual como lo haría un analista: tendencia (EMAs),
+    momentum (RSI + MACD) y fase de acumulación/distribución (OBV).
+    Devuelve un dict con la lectura y un texto listo para mostrar.
+    """
+    ultima = df.iloc[-1]
+    ema9, ema21, ema50 = ultima["EMA9"], ultima["EMA21"], ultima["EMA50"]
+    rsi = ultima["RSI"]
+    macd_hist = ultima["MACD_hist"]
+
+    if ema9 > ema21 > ema50:
+        tendencia, emoji_t = "Alcista", "📈"
+    elif ema9 < ema21 < ema50:
+        tendencia, emoji_t = "Bajista", "📉"
+    else:
+        tendencia, emoji_t = "Lateral/Indefinida", "↔️"
+
+    if rsi >= 70:
+        momentum = "Sobrecompra"
+    elif rsi >= 55:
+        momentum = "Momentum positivo"
+    elif rsi <= 30:
+        momentum = "Sobreventa"
+    elif rsi <= 45:
+        momentum = "Momentum negativo"
+    else:
+        momentum = "Neutral"
+
+    macd_dir = "alcista" if macd_hist > 0 else "bajista"
+    macd_cruce = ""
+    if len(df) >= 2:
+        prev_hist = df.iloc[-2]["MACD_hist"]
+        if prev_hist <= 0 < macd_hist:
+            macd_cruce = " (cruce alcista reciente)"
+        elif prev_hist >= 0 > macd_hist:
+            macd_cruce = " (cruce bajista reciente)"
+
+    obv_serie = df["OBV"].tail(ventana_obv)
+    if len(obv_serie) >= 2 and obv_serie.iloc[-1] != obv_serie.iloc[0]:
+        pendiente_obv = obv_serie.iloc[-1] - obv_serie.iloc[0]
+        volumen = "Acumulación (entrada de volumen)" if pendiente_obv > 0 else "Distribución (salida de volumen)"
+    else:
+        volumen = "Volumen estable / sin datos"
+
+    señales_alcistas = sum([
+        tendencia == "Alcista",
+        momentum in ("Momentum positivo", "Sobrecompra"),
+        macd_dir == "alcista",
+        volumen.startswith("Acumulación"),
+    ])
+    señales_bajistas = sum([
+        tendencia == "Bajista",
+        momentum in ("Momentum negativo", "Sobreventa"),
+        macd_dir == "bajista",
+        volumen.startswith("Distribución"),
+    ])
+
+    if señales_alcistas >= 3:
+        fuerza = "🟢 Confluencia alcista fuerte"
+    elif señales_bajistas >= 3:
+        fuerza = "🔴 Confluencia bajista fuerte"
+    elif señales_alcistas > señales_bajistas:
+        fuerza = "🟡 Sesgo alcista moderado"
+    elif señales_bajistas > señales_alcistas:
+        fuerza = "🟡 Sesgo bajista moderado"
+    else:
+        fuerza = "⚪ Sin confluencia clara (posible lateralización)"
+
+    detalle = (
+        f"{emoji_t} Tendencia (EMA 9/21/50): {tendencia}\n"
+        f"⚡ Momentum (RSI {rsi:.1f}): {momentum}\n"
+        f"📐 MACD: {macd_dir}{macd_cruce}\n"
+        f"📦 Volumen (OBV): {volumen}\n"
+        f"🧠 Lectura del analista: {fuerza}"
+    )
+    return {
+        "tendencia": tendencia, "momentum": momentum, "rsi": rsi,
+        "macd_dir": macd_dir, "volumen": volumen, "fuerza": fuerza, "detalle": detalle,
+    }
+
+
+def generar_estado_mercado():
+    """Snapshot compacto del estado técnico de todos los tickers (para el monitor en vivo)."""
+    ahora = datetime.now(NY_TZ).strftime("%d/%m/%Y %H:%M:%S")
+    lineas = []
+    for nombre, ticker_yf in TICKERS.items():
+        try:
+            t = yf.Ticker(ticker_yf)
+            df = t.history(period=PERIODO_ESCANEO, interval="15m")
+            if df.empty or len(df) < 25:
+                lineas.append(f"⚪ {nombre}: datos insuficientes")
+                continue
+            cols = ["Close"] + (["Volume"] if "Volume" in df.columns else [])
+            df = df[cols].copy()
+            df = calcular_indicadores(df)
+            tecnico = interpretar_tecnico(df)
+            precio = df.iloc[-1]["Close"]
+            emoji_fuerza = tecnico["fuerza"].split()[0]
+            lineas.append(
+                f"{emoji_fuerza} {nombre}: {precio:.2f} | {tecnico['tendencia']} | RSI {tecnico['rsi']:.0f}"
+            )
+        except Exception:
+            logger.exception("Error en monitor para %s", ticker_yf)
+            lineas.append(f"⚠️ {nombre}: error al obtener datos")
+
+    return (
+        f"📡 Monitor en vivo (15m) — actualizado {ahora} NY\n"
+        f"Se refresca cada 1 min en este mismo mensaje mientras el mercado está abierto.\n\n"
+        + "\n".join(lineas)
+    )
+
+
+async def actualizar_monitor(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Edita SIEMPRE el mismo mensaje en vez de mandar uno nuevo cada minuto.
+    Si el mensaje fue borrado o aún no existe, crea uno y lo recuerda.
+    """
+    chat_id = context.job.chat_id
+    if not mercado_activo():
+        return  # fuera de horario/fin de semana: no gastamos llamadas ni tocamos el mensaje
+
+    texto = generar_estado_mercado()
+    clave = f"monitor_msg_{chat_id}"
+    message_id = context.bot_data.get(clave)
+
+    if message_id:
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=texto)
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return  # el contenido no cambió, no hace falta hacer nada
+            logger.info("No se pudo editar el mensaje del monitor (%s); se crea uno nuevo.", e)
+
+    nuevo = await context.bot.send_message(chat_id=chat_id, text=texto)
+    context.bot_data[clave] = nuevo.message_id
+
+
 def escanear():
+    """
+    Escanea Bollinger en 5m y 15m para cada ticker, y cuando hay una ruptura
+    la enriquece con la lectura técnica (EMAs, RSI, MACD, OBV) para que la
+    alerta venga acompañada de contexto, no solo del precio cruzando la banda.
+    """
     alertas = []
     ahora = datetime.now(NY_TZ).strftime("%d/%m/%Y %H:%M")
 
     for nombre, ticker_yf in TICKERS.items():
         try:
             t = yf.Ticker(ticker_yf)
-            df = t.history(period=PERIODO, interval=INTERVALO)
-            if df.empty or len(df) < 20:
-                logger.warning("Datos insuficientes para %s", ticker_yf)
-                continue
+            resultados_ticker = []
 
-            df = df[["Close"]].copy()
-            df["SMA20"] = df["Close"].rolling(window=20).mean()
-            df["STD20"] = df["Close"].rolling(window=20).std()
-            df["Upper"] = df["SMA20"] + 2 * df["STD20"]
-            df["Lower"] = df["SMA20"] - 2 * df["STD20"]
+            for intervalo in INTERVALOS_ESCANEO:
+                df = t.history(period=PERIODO_ESCANEO, interval=intervalo)
+                if df.empty or len(df) < 25:
+                    logger.warning("Datos insuficientes para %s (%s)", ticker_yf, intervalo)
+                    continue
 
-            ultima = df.iloc[-1]
-            precio, upper, lower = ultima["Close"], ultima["Upper"], ultima["Lower"]
-            if pd.isna(upper) or pd.isna(lower):
-                continue
+                cols = ["Close"] + (["Volume"] if "Volume" in df.columns else [])
+                df = df[cols].copy()
+                df["SMA20"] = df["Close"].rolling(window=20).mean()
+                df["STD20"] = df["Close"].rolling(window=20).std()
+                df["Upper"] = df["SMA20"] + 2 * df["STD20"]
+                df["Lower"] = df["SMA20"] - 2 * df["STD20"]
+                df = calcular_indicadores(df)
 
-            if precio > upper:
-                alertas.append(f"🟢 {nombre} ({ticker_yf}) SOBRE la banda superior\nPrecio: {precio:.2f} | Banda: {upper:.2f}")
-            elif precio < lower:
-                alertas.append(f"🔴 {nombre} ({ticker_yf}) DEBAJO de la banda inferior\nPrecio: {precio:.2f} | Banda: {lower:.2f}")
+                ultima = df.iloc[-1]
+                precio, upper, lower = ultima["Close"], ultima["Upper"], ultima["Lower"]
+                if pd.isna(upper) or pd.isna(lower):
+                    continue
+
+                if precio > upper:
+                    emoji, texto_lado, banda = "🟢", "SOBRE la banda superior", upper
+                elif precio < lower:
+                    emoji, texto_lado, banda = "🔴", "DEBAJO de la banda inferior", lower
+                else:
+                    continue
+
+                tecnico = interpretar_tecnico(df)
+                resultados_ticker.append(
+                    f"{emoji} {nombre} ({ticker_yf}) · {intervalo}\n"
+                    f"{texto_lado} — Precio: {precio:.2f} | Banda: {banda:.2f}\n\n"
+                    f"{tecnico['detalle']}"
+                )
+
+            if resultados_ticker:
+                alertas.append("\n\n".join(resultados_ticker))
         except Exception:
             logger.exception("Error escaneando %s", ticker_yf)
 
+    intervalos_txt = "/".join(INTERVALOS_ESCANEO)
     if not alertas:
-        return f"✅ {ahora}\nNinguna acción fuera de Bollinger ({INTERVALO})."
-    return f"📊 Escaneo {ahora} ({INTERVALO})\n\n" + "\n\n".join(alertas)
+        return f"✅ {ahora}\nNinguna acción fuera de Bollinger ({intervalos_txt})."
+    return f"📊 Escaneo {ahora} ({intervalos_txt})\n\n" + "\n\n───────\n\n".join(alertas)
 
 
 # ══════════════════════════════════════════════════════════
@@ -553,19 +763,22 @@ def preprocesar_imagen(img: Image.Image) -> Image.Image:
     img = ImageOps.autocontrast(img)
     return img
 
-    url = "https://trading-journal-1iiz.onrender.com"  # ← Reemplaza por tu URL real
 
+async def journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Abre el mini-app del trading journal. (Antes este código estaba muerto
+    dentro de preprocesar_imagen, después de un return, por lo que /journal
+    nunca podía funcionar; quedó separado como su propio comando.)"""
+    url = "https://trading-journal-1iiz.onrender.com"  # ← Reemplaza por tu URL real
     teclado = InlineKeyboardMarkup([
         [InlineKeyboardButton("📒 Abrir Journal", web_app=WebAppInfo(url=url))]
     ])
-
     try:
         await update.message.reply_text(
             "Toca el botón para abrir tu journal:",
-            reply_markup=teclado
+            reply_markup=teclado,
         )
-    except Exception as e:
-        print(f"Error enviando journal: {e}")
+    except Exception:
+        logger.exception("Error enviando journal")
 
 # ══════════════════════════════════════════════════════════
 # PROCESAMIENTO DE IMÁGENES
@@ -576,6 +789,8 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("pytesseract no está instalado; se ignora la imagen recibida.")
         return
 
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     bio = BytesIO()
@@ -585,6 +800,7 @@ async def procesar_imagen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         img = Image.open(bio)
         img_procesada = preprocesar_imagen(img)
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         texto_ocr = pytesseract.image_to_string(img_procesada, lang=OCR_LANG)
     except Exception:
         logger.exception("Fallo al procesar OCR de la imagen")
@@ -797,7 +1013,8 @@ async def saludo_viernes(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def escaneo_programado(context: ContextTypes.DEFAULT_TYPE):
-    if not dentro_horario_bollinger():
+    # Sábado y domingo el mercado está cerrado: no se escanea ni se escribe nada.
+    if not mercado_activo():
         return
     mensaje = escanear()
     if "Ninguna" not in mensaje:
@@ -805,6 +1022,9 @@ async def escaneo_programado(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def felicitacion_diaria(context: ContextTypes.DEFAULT_TYPE):
+    # No hay jornada que cerrar en fin de semana.
+    if not es_dia_habil():
+        return
     dia = obtener_dia_actual()
     info = get_day_data(dia)
     profit, capital, usuarios = info["profit"], info["capital"], info["usuarios"]
@@ -821,19 +1041,12 @@ async def felicitacion_diaria(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHAT_ID, text=mensaje)
 
 
-def programar_felicitacion(job_queue):
-    ahora_ny = datetime.now(NY_TZ)
-    proximo = ahora_ny.replace(hour=18, minute=0, second=0, microsecond=0)
-    if ahora_ny >= proximo:
-        proximo += timedelta(days=1)
-    job_queue.run_once(felicitacion_diaria, (proximo - ahora_ny).total_seconds())
-
-
 # ══════════════════════════════════════════════════════════
 # BACKUP / RESTORE
 # ══════════════════════════════════════════════════════════
 async def enviar_backup(bot, chat_id, motivo="manual"):
     try:
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
         with _db_lock:
             # checkpoint para asegurarnos de volcar el WAL al archivo principal antes de copiarlo
             with closing(get_conn()) as conn, conn:
@@ -927,18 +1140,21 @@ async def boton_escanear_ahora(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer("Escaneando...")
     await query.edit_message_text("⏳ Escaneando el mercado, espera unos segundos...")
+    await context.bot.send_chat_action(chat_id=query.message.chat_id, action=ChatAction.TYPING)
     await context.bot.send_message(chat_id=query.message.chat_id, text=escanear())
 
 
 async def boton_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    estado_dia = "✅ Día hábil" if es_dia_habil() else "⛔ Fin de semana (mercado cerrado)"
     estado_horario = "✅ Dentro del horario NY" if dentro_horario_bollinger() else "⏸️ Fuera del horario NY"
     ocr_estado = "✅ Disponible" if TESSERACT_DISPONIBLE else "❌ No instalado"
     mensaje = (
-        f"📊 Estado del bot\n\n🔹 Activo: ✅\n🔹 OCR: {ocr_estado}\n🔹 Intervalo de velas: {INTERVALO}\n"
+        f"📊 Estado del bot\n\n🔹 Activo: ✅\n🔹 OCR: {ocr_estado}\n"
+        f"🔹 Intervalos de escaneo: {'/'.join(INTERVALOS_ESCANEO)}\n"
         f"🔹 Horario NY: {HORA_INICIO_BOLLINGER.strftime('%H:%M')} - {HORA_FIN_BOLLINGER.strftime('%H:%M')}\n"
-        f"🔹 Estado actual: {estado_horario}\n🔹 Símbolos monitoreados: {len(TICKERS)}\n"
+        f"🔹 {estado_dia}\n🔹 Estado actual: {estado_horario}\n🔹 Símbolos monitoreados: {len(TICKERS)}\n"
         f"🔹 Semana en curso: {get_current_week_start()}"
     )
     await query.edit_message_text(text=mensaje)
@@ -970,7 +1186,9 @@ async def boton_ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
 TEXTO_AYUDA = (
     "❓ Comandos disponibles\n\n"
     "/start o /menu - Menú principal\n"
-    "/escanear - Forzar un escaneo manual\n"
+    "/escanear - Forzar un escaneo manual (Bollinger 5m/15m + análisis técnico)\n"
+    "/tecnico TICKER - Análisis técnico bajo demanda (ej: /tecnico NVDA)\n"
+    "/monitor - Activa/desactiva un mensaje que se auto-actualiza cada 1 min con el estado del mercado\n"
     "/resumen - Ver el resumen de la semana en curso\n"
     "/misstats - Tus estadísticas personales\n"
     "/historial - Resultados de las últimas semanas\n"
@@ -979,7 +1197,9 @@ TEXTO_AYUDA = (
     "Además, registro automáticamente:\n"
     "• Mensajes de texto con sentimiento positivo/negativo\n"
     "• Trades enviados en formato JSON\n"
-    "• Capturas de pantalla donde se detecte un resultado de operación (profit/pérdida)"
+    "• Capturas de pantalla donde se detecte un resultado de operación (profit/pérdida)\n\n"
+    "🗓️ El escaneo automático de Bollinger (5m y 15m) solo corre de lunes a viernes, "
+    "dentro del horario configurado. Sábado y domingo el bot no envía alertas de mercado."
 )
 
 
@@ -988,8 +1208,79 @@ async def comando_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def comando_escanear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     await update.message.reply_text("⏳ Escaneando... puede tardar unos segundos.")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     await update.message.reply_text(escanear())
+
+
+async def comando_tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    ticker_nombre = args[0].upper() if args else "NAS100"
+    ticker_yf = TICKERS.get(ticker_nombre)
+    if not ticker_yf:
+        await update.message.reply_text(
+            "Ticker no reconocido. Usa uno de: " + ", ".join(TICKERS.keys()) +
+            "\nEjemplo: /tecnico NVDA"
+        )
+        return
+
+    await update.message.reply_text(f"⏳ Analizando {ticker_nombre}...")
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    try:
+        t = yf.Ticker(ticker_yf)
+        df = t.history(period=PERIODO_ESCANEO, interval="15m")
+        if df.empty or len(df) < 25:
+            await update.message.reply_text("No hay suficientes datos para analizar este ticker ahora mismo.")
+            return
+
+        cols = ["Close"] + (["Volume"] if "Volume" in df.columns else [])
+        df = df[cols].copy()
+        df["SMA20"] = df["Close"].rolling(window=20).mean()
+        df["STD20"] = df["Close"].rolling(window=20).std()
+        df["Upper"] = df["SMA20"] + 2 * df["STD20"]
+        df["Lower"] = df["SMA20"] - 2 * df["STD20"]
+        df = calcular_indicadores(df)
+        tecnico = interpretar_tecnico(df)
+        precio = df.iloc[-1]["Close"]
+
+        await update.message.reply_text(
+            f"📊 Análisis técnico — {ticker_nombre} (15m)\n\n💲 Precio actual: {precio:.2f}\n\n{tecnico['detalle']}"
+        )
+    except Exception:
+        logger.exception("Error en /tecnico")
+        await update.message.reply_text("⚠️ No pude generar el análisis, intenta de nuevo más tarde.")
+
+
+async def comando_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    nombre_job = f"monitor_{chat_id}"
+    jobs = context.job_queue.get_jobs_by_name(nombre_job)
+
+    if jobs:
+        for j in jobs:
+            j.schedule_removal()
+        context.bot_data.pop(f"monitor_msg_{chat_id}", None)
+        await update.message.reply_text("🛑 Monitor en vivo desactivado.")
+        return
+
+    if mercado_activo():
+        texto_inicial = generar_estado_mercado()
+    else:
+        texto_inicial = (
+            "⏸️ Mercado cerrado ahora mismo.\n"
+            "El monitor se actualizará automáticamente (en este mismo mensaje) "
+            "cuando el mercado vuelva a abrir, de lunes a viernes."
+        )
+    msg = await update.message.reply_text(texto_inicial)
+    context.bot_data[f"monitor_msg_{chat_id}"] = msg.message_id
+    context.job_queue.run_repeating(
+        actualizar_monitor, interval=60, first=60, chat_id=chat_id, name=nombre_job
+    )
+    await update.message.reply_text(
+        "✅ Monitor en vivo activado: este mensaje se irá actualizando solo, cada 1 minuto, "
+        "en lugar de mandar uno nuevo cada vez. Usa /monitor otra vez para apagarlo."
+    )
 
 
 async def comando_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1082,6 +1373,8 @@ async def post_init(application):
         BotCommand("start", "Mostrar menú principal"),
         BotCommand("menu", "Mostrar menú principal"),
         BotCommand("escanear", "Forzar escaneo manual"),
+        BotCommand("tecnico", "Análisis técnico de un ticker"),
+        BotCommand("monitor", "Activar/desactivar monitor en vivo"),
         BotCommand("resumen", "Ver el resumen de la semana"),
         BotCommand("misstats", "Ver tus estadísticas personales"),
         BotCommand("historial", "Ver semanas anteriores"),
@@ -1127,6 +1420,8 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", comando_menu))
     app.add_handler(CommandHandler("escanear", comando_escanear))
+    app.add_handler(CommandHandler("tecnico", comando_tecnico))
+    app.add_handler(CommandHandler("monitor", comando_monitor))
     app.add_handler(CommandHandler("resumen", comando_resumen))
     app.add_handler(CommandHandler("misstats", comando_misstats))
     app.add_handler(CommandHandler("historial", comando_historial))
@@ -1152,11 +1447,15 @@ def main():
     app.add_error_handler(manejador_errores)
 
     # Tareas programadas
-    intervalo_seg = 300 if INTERVALO == "5m" else 900
-    app.job_queue.run_repeating(escaneo_programado, interval=intervalo_seg, first=10)
-    app.job_queue.run_daily(saludo_lunes, time=time(7, 0), days=(0,))
-    app.job_queue.run_daily(saludo_viernes, time=time(11, 30), days=(4,))
-    programar_felicitacion(app.job_queue)
+    # Se escanea cada 5 minutos; escaneo_programado ya filtra día hábil + horario NY.
+    app.job_queue.run_repeating(escaneo_programado, interval=300, first=10)
+    # Todos los horarios llevan tzinfo=NY_TZ para que "lunes"/"viernes" se evalúen
+    # en hora de Nueva York y no en UTC (evita que el saludo caiga en el día equivocado).
+    app.job_queue.run_daily(saludo_lunes, time=time(7, 0, tzinfo=NY_TZ), days=(0,))
+    app.job_queue.run_daily(saludo_viernes, time=time(11, 30, tzinfo=NY_TZ), days=(4,))
+    app.job_queue.run_daily(
+        felicitacion_diaria, time=time(18, 0, tzinfo=NY_TZ), days=(0, 1, 2, 3, 4)
+    )
 
     logger.info("🤖 Bot iniciado y monitoreando el mercado...")
     app.run_polling(drop_pending_updates=True)
