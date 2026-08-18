@@ -17,6 +17,7 @@ from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 import pytz
+import requests
 import yfinance as yf
 import pandas as pd
 from PIL import Image, ImageOps
@@ -92,6 +93,7 @@ TICKERS = {
     "AMZN": "AMZN",
     "META": "META",
     "NAS100": "^NDX",
+    "SP500": "^GSPC",
 }
 
 INTERVALOS_ESCANEO = ["5m", "15m"]  # Bollinger se evalúa en ambas temporalidades
@@ -479,30 +481,35 @@ def generar_estado_mercado():
     )
 
 
-async def actualizar_monitor(context: ContextTypes.DEFAULT_TYPE):
+async def _editar_o_enviar_mensaje(bot, bot_data, chat_id, clave, texto):
     """
-    Edita SIEMPRE el mismo mensaje en vez de mandar uno nuevo cada minuto.
-    Si el mensaje fue borrado o aún no existe, crea uno y lo recuerda.
+    Edita SIEMPRE el mismo mensaje (guardado en bot_data[clave]) en vez de
+    mandar uno nuevo. Si no existe todavía, o el anterior ya no se puede
+    editar (borrado, muy viejo, etc.), crea uno nuevo y lo recuerda para
+    la próxima actualización. Así el chat nunca se llena de mensajes
+    repetidos: siempre hay UN solo mensaje que se va sustituyendo.
     """
-    chat_id = context.job.chat_id
-    if not mercado_activo():
-        return  # fuera de horario/fin de semana: no gastamos llamadas ni tocamos el mensaje
-
-    texto = generar_estado_mercado()
-    clave = f"monitor_msg_{chat_id}"
-    message_id = context.bot_data.get(clave)
-
+    message_id = bot_data.get(clave)
     if message_id:
         try:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=texto)
+            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=texto)
             return
         except BadRequest as e:
             if "not modified" in str(e).lower():
                 return  # el contenido no cambió, no hace falta hacer nada
-            logger.info("No se pudo editar el mensaje del monitor (%s); se crea uno nuevo.", e)
+            logger.info("No se pudo editar el mensaje '%s' (%s); se crea uno nuevo.", clave, e)
 
-    nuevo = await context.bot.send_message(chat_id=chat_id, text=texto)
-    context.bot_data[clave] = nuevo.message_id
+    nuevo = await bot.send_message(chat_id=chat_id, text=texto)
+    bot_data[clave] = nuevo.message_id
+
+
+async def actualizar_monitor(context: ContextTypes.DEFAULT_TYPE):
+    """Actualiza (editando, no reenviando) el dashboard de estado del mercado."""
+    chat_id = context.job.chat_id
+    if not mercado_activo():
+        return  # fuera de horario/fin de semana: no gastamos llamadas ni tocamos el mensaje
+    texto = generar_estado_mercado()
+    await _editar_o_enviar_mensaje(context.bot, context.bot_data, chat_id, f"monitor_msg_{chat_id}", texto)
 
 
 def escanear():
@@ -615,7 +622,16 @@ def extraer_numero(texto):
 # un resultado de operación real (requisito del bot).
 # ══════════════════════════════════════════════════════════
 def parsear_ocr_trade(texto_ocr):
-    """Capturas de opciones (formato tipo ThinkOrSwim/broker de opciones)."""
+    """Capturas de opciones (formato tipo ThinkOrSwim/broker de opciones).
+
+    Antes esta función solo tomaba el PRIMER fill de compra y el PRIMER fill
+    de venta (`next(...)`). Si la captura tenía varias operaciones/fills
+    parciales (ej. 3 compras a distinto precio + 2 ventas a distinto precio),
+    ignoraba el resto y el cálculo quedaba mal. Ahora se agregan TODOS los
+    fills de cada lado y se calcula un precio promedio ponderado por
+    cantidad — así el resultado es correcto sin importar cuántas líneas
+    de ejecución traiga la imagen.
+    """
     match_info = re.search(
         r'([A-Z]{2,5})\s+\d+\s+\(Weeklys\)\s+(\d{1,2}\s+[A-Z]{3}\s+\d{2}).*?(\d{3,4})\s*([CP])',
         texto_ocr, re.IGNORECASE,
@@ -649,15 +665,41 @@ def parsear_ocr_trade(texto_ocr):
     if len(trades) < 2:
         return None
 
-    buy = next((t for t in trades if t["action"] == "BOT"), None)
-    sell = next((t for t in trades if t["action"] == "SOLD"), None)
-    if not buy or not sell:
+    compras = [t for t in trades if t["action"] == "BOT"]
+    ventas = [t for t in trades if t["action"] == "SOLD"]
+    if not compras or not ventas:
         return None
 
-    profit_per_contract = round(sell["price"] - buy["price"], 2)
-    total_profit = profit_per_contract * buy["quantity"] * 100
-    capital = buy["price"] * buy["quantity"] * 100
+    qty_compra = sum(t["quantity"] for t in compras)
+    qty_venta = sum(t["quantity"] for t in ventas)
+    if qty_compra <= 0 or qty_venta <= 0:
+        return None
+
+    # Precio promedio ponderado por cantidad de cada lado (compra y venta),
+    # que es la forma matemáticamente correcta de "promediar" varios fills.
+    precio_compra_prom = sum(t["price"] * t["quantity"] for t in compras) / qty_compra
+    precio_venta_prom = sum(t["price"] * t["quantity"] for t in ventas) / qty_venta
+
+    # Solo se puede atribuir profit a los contratos que realmente se cerraron
+    # (el menor entre lo comprado y lo vendido); si quedaron contratos sin
+    # cerrar del otro lado, se avisa en el detalle en vez de inventar un profit.
+    contratos_cerrados = min(qty_compra, qty_venta)
+    profit_per_contract = round(precio_venta_prom - precio_compra_prom, 2)
+    total_profit = profit_per_contract * contratos_cerrados * 100
+    capital = precio_compra_prom * contratos_cerrados * 100
     porcentaje = (total_profit / capital * 100) if capital > 0 else 0.0
+
+    nota_fills = ""
+    if len(compras) > 1 or len(ventas) > 1:
+        nota_fills += (
+            f"\n🧮 {len(compras)} fill(s) de compra prom. ${precio_compra_prom:.2f} "
+            f"({qty_compra} contratos) · {len(ventas)} fill(s) de venta prom. "
+            f"${precio_venta_prom:.2f} ({qty_venta} contratos)"
+        )
+    if qty_compra != qty_venta:
+        restante = abs(qty_compra - qty_venta)
+        lado = "compra" if qty_compra > qty_venta else "venta"
+        nota_fills += f"\n⚠️ Quedan {restante} contrato(s) sin cerrar del lado de {lado} (no se contaron en el profit)."
 
     return {
         "profit": total_profit,
@@ -665,7 +707,8 @@ def parsear_ocr_trade(texto_ocr):
         "porcentaje": round(porcentaje, 2),
         "detalle": (
             f"🔹 Símbolo: {symbol}\n📅 Expiración: {expiration}\n🎯 Strike: {strike} {tipo}\n"
-            f"🔢 Contratos: {buy['quantity']}\n📈 Compra: ${buy['price']:.2f}\n📉 Venta: ${sell['price']:.2f}"
+            f"🔢 Contratos cerrados: {contratos_cerrados}\n📈 Compra prom.: ${precio_compra_prom:.2f}\n"
+            f"📉 Venta prom.: ${precio_venta_prom:.2f}{nota_fills}"
         ),
     }
 
@@ -734,15 +777,29 @@ _SIGNED_MONEY = re.compile(
 
 def parsear_ocr_generico(texto_ocr):
     """
-    Último fallback: cualquier captura donde se detecte un profit/resultado,
-    aunque no encaje con un broker específico. Exige contexto (palabra clave
-    o signo + formato monetario) para minimizar falsos positivos.
-    """
-    m = _KEYWORD_PROFIT.search(texto_ocr)
-    if m:
-        valor = extraer_numero(m.group(1).replace("$", ""))
-        return {"profit": valor, "capital": None, "porcentaje": None, "detalle": f"Detectado: “{m.group(0).strip()}”"}
+    Último fallback: cualquier captura donde se detecten uno o varios
+    profit/resultado, aunque no encaje con un broker específico. Exige
+    contexto (palabra clave o signo + formato monetario) para minimizar
+    falsos positivos.
 
+    Antes solo tomaba la PRIMERA coincidencia (`.search`), así que una
+    captura con una tabla de varias operaciones (varias líneas de profit)
+    perdía todo menos la primera. Ahora se recolectan TODAS las
+    coincidencias y se suman, que es el resultado correcto cuando la
+    imagen muestra varias operaciones/fills.
+    """
+    matches_keyword = list(_KEYWORD_PROFIT.finditer(texto_ocr))
+    if matches_keyword:
+        valores = [extraer_numero(m.group(1).replace("$", "")) for m in matches_keyword]
+        total = sum(valores)
+        if len(valores) > 1:
+            lista = ", ".join(f"${v:.2f}" for v in valores)
+            detalle = f"Detectadas {len(valores)} operaciones: {lista} → suma total ${total:.2f}"
+        else:
+            detalle = f"Detectado: “{matches_keyword[0].group(0).strip()}”"
+        return {"profit": total, "capital": None, "porcentaje": None, "detalle": detalle}
+
+    encontrados = []
     for m in _SIGNED_MONEY.finditer(texto_ocr):
         crudo = m.group(1)
         moneda = m.group(2)
@@ -752,8 +809,17 @@ def parsear_ocr_generico(texto_ocr):
             kw in linea_completa for kw in ["usd", "$", "balance", "equity", "equidad", "trade", "posici"]
         )
         if contexto_ok:
-            valor = extraer_numero(crudo.replace("$", ""))
-            return {"profit": valor, "capital": None, "porcentaje": None, "detalle": f"Detectado: “{crudo.strip()}”"}
+            encontrados.append(extraer_numero(crudo.replace("$", "")))
+
+    if encontrados:
+        total = sum(encontrados)
+        if len(encontrados) > 1:
+            lista = ", ".join(f"${v:.2f}" for v in encontrados)
+            detalle = f"Detectadas {len(encontrados)} operaciones: {lista} → suma total ${total:.2f}"
+        else:
+            detalle = f"Detectado: ${encontrados[0]:.2f}"
+        return {"profit": total, "capital": None, "porcentaje": None, "detalle": detalle}
+
     return None
 
 
@@ -992,6 +1058,75 @@ def generar_resumen_semanal():
 
 
 # ══════════════════════════════════════════════════════════
+# CALENDARIO ECONÓMICO (TradingView — endpoint público, gratuito)
+# ══════════════════════════════════════════════════════════
+CALENDARIO_TV_URL = "https://economic-calendar.tradingview.com/events"
+CALENDARIO_PAISES = "US"  # cambia/agrega códigos (ej. "US,EU") si quieres más regiones
+
+
+def obtener_calendario_economico():
+    """
+    Consulta el calendario económico público de TradingView y devuelve los
+    eventos de ALTO impacto (ej. FOMC, CPI, NFP) programados para hoy.
+
+    Nota: este es el endpoint no-oficial que usa el propio widget de
+    TradingView (economic-calendar.tradingview.com), no hay API key de
+    por medio porque TradingView no ofrece una oficial y gratuita para
+    esto. Al ser no-oficial, TradingView podría cambiar el formato o
+    bloquear la IP del servidor en cualquier momento; por eso todo está
+    envuelto en try/except y si falla simplemente se avisa en vez de
+    romper el saludo de las 7am. Si en algún momento deja de funcionar,
+    revisa la respuesta cruda (agrega un logger.info(resp.text)) para
+    ver si TradingView cambió los nombres de los campos.
+    """
+    try:
+        hoy_ny = datetime.now(NY_TZ).date()
+        desde = datetime.combine(hoy_ny, time(0, 0)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        hasta = datetime.combine(hoy_ny + timedelta(days=1), time(0, 0)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; TradingJournalBot/1.0)",
+            "Origin": "https://www.tradingview.com",
+            "Referer": "https://www.tradingview.com/economic-calendar/",
+        }
+        params = {"from": desde, "to": hasta, "countries": CALENDARIO_PAISES}
+
+        resp = requests.get(CALENDARIO_TV_URL, params=params, headers=headers, timeout=10)
+        resp.raise_for_status()
+        eventos = resp.json().get("result", [])
+    except Exception:
+        logger.exception("No se pudo obtener el calendario económico de TradingView")
+        return None
+
+    # importance en TradingView: 1 = alto impacto, 0 = medio, -1 = bajo.
+    alto_impacto = [e for e in eventos if (e.get("importance") or 0) >= 1]
+    if not alto_impacto:
+        return "🗞️ Calendario económico de hoy\n\nNo hay eventos de alto impacto programados en EE.UU. para hoy."
+
+    alto_impacto.sort(key=lambda e: e.get("date", ""))
+    lineas = []
+    for e in alto_impacto:
+        try:
+            hora_utc = datetime.strptime(e["date"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=pytz.utc)
+            hora_ny = hora_utc.astimezone(NY_TZ).strftime("%H:%M")
+        except Exception:
+            hora_ny = "?"
+
+        titulo = e.get("title") or e.get("indicator") or "Evento económico"
+        pronostico = e.get("forecast")
+        previo = e.get("previous")
+        extras = []
+        if pronostico not in (None, ""):
+            extras.append(f"pronóstico: {pronostico}")
+        if previo not in (None, ""):
+            extras.append(f"previo: {previo}")
+        extra_txt = f" ({', '.join(extras)})" if extras else ""
+        lineas.append(f"🔴 {hora_ny} NY — {titulo}{extra_txt}")
+
+    return "🗞️ Calendario económico de hoy — eventos de alto impacto (EE.UU.)\n\n" + "\n".join(lineas)
+
+
+# ══════════════════════════════════════════════════════════
 # TAREAS PROGRAMADAS
 # ══════════════════════════════════════════════════════════
 def obtener_saludo(lista):
@@ -1005,6 +1140,31 @@ async def saludo_lunes(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHAT_ID, text=mensaje)
 
 
+async def mensaje_matutino(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Se ejecuta de lunes a viernes a las 7:00 NY. El calendario económico
+    (FOMC, CPI, NFP, etc.) es siempre el PRIMER mensaje del día; los lunes,
+    justo después, se manda el saludo semanal y se reinicia la semana.
+    """
+    if not es_dia_habil():
+        return
+
+    calendario = obtener_calendario_economico()
+    if calendario:
+        await context.bot.send_message(chat_id=CHAT_ID, text=calendario)
+    else:
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            text=(
+                "🗞️ No pude obtener el calendario económico de TradingView esta mañana. "
+                "Revisa manualmente si hay datos de alto impacto (FOMC, CPI, NFP, etc.)."
+            ),
+        )
+
+    if datetime.now(NY_TZ).weekday() == 0:  # lunes
+        await saludo_lunes(context)
+
+
 async def saludo_viernes(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHAT_ID, text=obtener_saludo(SALUDOS_VIERNES))
     await context.bot.send_message(chat_id=CHAT_ID, text=generar_resumen_semanal())
@@ -1013,12 +1173,13 @@ async def saludo_viernes(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def escaneo_programado(context: ContextTypes.DEFAULT_TYPE):
-    # Sábado y domingo el mercado está cerrado: no se escanea ni se escribe nada.
+    # Sábado y domingo el mercado está cerrado: no se escanea ni se toca nada.
     if not mercado_activo():
         return
     mensaje = escanear()
-    if "Ninguna" not in mensaje:
-        await context.bot.send_message(chat_id=CHAT_ID, text=mensaje)
+    # Se EDITA siempre el mismo mensaje (no se manda uno nuevo cada 5 min),
+    # así el grupo no se llena de mensajes repetidos con la misma info.
+    await _editar_o_enviar_mensaje(context.bot, context.bot_data, CHAT_ID, "scan_msg", mensaje)
 
 
 async def felicitacion_diaria(context: ContextTypes.DEFAULT_TYPE):
@@ -1189,6 +1350,7 @@ TEXTO_AYUDA = (
     "/escanear - Forzar un escaneo manual (Bollinger 5m/15m + análisis técnico)\n"
     "/tecnico TICKER - Análisis técnico bajo demanda (ej: /tecnico NVDA)\n"
     "/monitor - Activa/desactiva un mensaje que se auto-actualiza cada 1 min con el estado del mercado\n"
+    "/noticias - Ver el calendario económico de hoy (FOMC, CPI, NFP, etc.)\n"
     "/resumen - Ver el resumen de la semana en curso\n"
     "/misstats - Tus estadísticas personales\n"
     "/historial - Resultados de las últimas semanas\n"
@@ -1199,7 +1361,8 @@ TEXTO_AYUDA = (
     "• Trades enviados en formato JSON\n"
     "• Capturas de pantalla donde se detecte un resultado de operación (profit/pérdida)\n\n"
     "🗓️ El escaneo automático de Bollinger (5m y 15m) solo corre de lunes a viernes, "
-    "dentro del horario configurado. Sábado y domingo el bot no envía alertas de mercado."
+    "dentro del horario configurado, y actualiza SIEMPRE el mismo mensaje (no manda uno nuevo cada vez).\n"
+    "🗞️ A las 7am (NY), de lunes a viernes, el primer mensaje del día es el calendario económico de alto impacto."
 )
 
 
@@ -1250,6 +1413,14 @@ async def comando_tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logger.exception("Error en /tecnico")
         await update.message.reply_text("⚠️ No pude generar el análisis, intenta de nuevo más tarde.")
+
+
+async def comando_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    calendario = obtener_calendario_economico()
+    await update.message.reply_text(
+        calendario or "No pude obtener el calendario económico de TradingView en este momento."
+    )
 
 
 async def comando_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1375,6 +1546,7 @@ async def post_init(application):
         BotCommand("escanear", "Forzar escaneo manual"),
         BotCommand("tecnico", "Análisis técnico de un ticker"),
         BotCommand("monitor", "Activar/desactivar monitor en vivo"),
+        BotCommand("noticias", "Ver calendario económico de hoy"),
         BotCommand("resumen", "Ver el resumen de la semana"),
         BotCommand("misstats", "Ver tus estadísticas personales"),
         BotCommand("historial", "Ver semanas anteriores"),
@@ -1422,6 +1594,7 @@ def main():
     app.add_handler(CommandHandler("escanear", comando_escanear))
     app.add_handler(CommandHandler("tecnico", comando_tecnico))
     app.add_handler(CommandHandler("monitor", comando_monitor))
+    app.add_handler(CommandHandler("noticias", comando_noticias))
     app.add_handler(CommandHandler("resumen", comando_resumen))
     app.add_handler(CommandHandler("misstats", comando_misstats))
     app.add_handler(CommandHandler("historial", comando_historial))
@@ -1451,7 +1624,9 @@ def main():
     app.job_queue.run_repeating(escaneo_programado, interval=300, first=10)
     # Todos los horarios llevan tzinfo=NY_TZ para que "lunes"/"viernes" se evalúen
     # en hora de Nueva York y no en UTC (evita que el saludo caiga en el día equivocado).
-    app.job_queue.run_daily(saludo_lunes, time=time(7, 0, tzinfo=NY_TZ), days=(0,))
+    # El mensaje de las 7am corre TODOS los días hábiles: primero el calendario
+    # económico (siempre) y, si es lunes, el saludo semanal justo después.
+    app.job_queue.run_daily(mensaje_matutino, time=time(7, 0, tzinfo=NY_TZ), days=(0, 1, 2, 3, 4))
     app.job_queue.run_daily(saludo_viernes, time=time(11, 30, tzinfo=NY_TZ), days=(4,))
     app.job_queue.run_daily(
         felicitacion_diaria, time=time(18, 0, tzinfo=NY_TZ), days=(0, 1, 2, 3, 4)
