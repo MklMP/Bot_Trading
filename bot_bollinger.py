@@ -481,7 +481,7 @@ def generar_estado_mercado():
     )
 
 
-async def _editar_o_enviar_mensaje(bot, bot_data, chat_id, clave, texto):
+async def _editar_o_enviar_mensaje(bot, bot_data, chat_id, clave, texto, reply_markup=None):
     """
     Edita SIEMPRE el mismo mensaje (guardado en bot_data[clave]) en vez de
     mandar uno nuevo. Si no existe todavía, o el anterior ya no se puede
@@ -492,14 +492,16 @@ async def _editar_o_enviar_mensaje(bot, bot_data, chat_id, clave, texto):
     message_id = bot_data.get(clave)
     if message_id:
         try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=texto)
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id, text=texto, reply_markup=reply_markup
+            )
             return
         except BadRequest as e:
             if "not modified" in str(e).lower():
                 return  # el contenido no cambió, no hace falta hacer nada
             logger.info("No se pudo editar el mensaje '%s' (%s); se crea uno nuevo.", clave, e)
 
-    nuevo = await bot.send_message(chat_id=chat_id, text=texto)
+    nuevo = await bot.send_message(chat_id=chat_id, text=texto, reply_markup=reply_markup)
     bot_data[clave] = nuevo.message_id
 
 
@@ -1063,11 +1065,307 @@ def generar_resumen_semanal():
 CALENDARIO_TV_URL = "https://economic-calendar.tradingview.com/events"
 CALENDARIO_PAISES = "US"  # cambia/agrega códigos (ej. "US,EU") si quieres más regiones
 
+# Diccionario de indicadores económicos de EE.UU. más comunes: nombre en
+# español, qué mide, cómo afecta típicamente al USD cuando sale mejor/peor
+# de lo esperado, y qué activo suele reaccionar más. Es una guía general,
+# no garantiza el movimiento real del mercado (siempre puede haber
+# sorpresas o que el mercado ya lo tuviera "descontado").
+# El orden importa: los patrones más específicos van ANTES que los
+# genéricos (ej. "core cpi" antes que "cpi") para no confundirlos.
+DICCIONARIO_INDICADORES = [
+    (("fomc press conference", "powell press conference"), {
+        "es": "Conferencia de prensa del FOMC (Powell)",
+        "explica": "Rueda de prensa del presidente de la Reserva Federal tras la decisión de tasas, donde explica el razonamiento y da pistas sobre el futuro de la política monetaria.",
+        "usd": "Un tono \"hawkish\" (duro, preocupado por la inflación, abierto a subir/mantener tasas altas) suele fortalecer al USD. Un tono \"dovish\" (más flexible, hablando de bajar tasas) suele debilitarlo.",
+        "afecta": "Todo el mercado: NAS100/tecnológicas (muy sensibles a tasas), oro, bonos del Tesoro y el propio USD.",
+    }),
+    (("fomc statement",), {
+        "es": "Comunicado del FOMC",
+        "explica": "Texto oficial que acompaña la decisión de tasas de interés de la Reserva Federal, con el diagnóstico de la economía y el sesgo de política monetaria.",
+        "usd": "Cambios de lenguaje hacia más restrictivo fortalecen al USD; hacia más flexible lo debilitan.",
+        "afecta": "NAS100/tecnológicas, oro y bonos del Tesoro.",
+    }),
+    (("fomc meeting minutes", "fomc minutes"), {
+        "es": "Minutas de la Fed (FOMC)",
+        "explica": "Acta detallada de la última reunión de la Reserva Federal; muestra qué tan divididos estaban los miembros y qué factores están vigilando.",
+        "usd": "Si revela más preocupación por la inflación de lo esperado, suele fortalecer al USD; si muestra más cautela sobre el crecimiento, suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas, oro y bonos del Tesoro.",
+    }),
+    (("interest rate decision", "fed interest rate"), {
+        "es": "Decisión de tasas de interés (FOMC)",
+        "explica": "Es cuando la Reserva Federal anuncia si sube, baja o mantiene la tasa de referencia de EE.UU., la herramienta principal para controlar la inflación y el crecimiento.",
+        "usd": "Subir tasas (o ser más duro de lo esperado) suele fortalecer al USD, porque atrae capital buscando mejor rendimiento. Bajar tasas (o ser más suave) suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas (muy sensibles al costo del dinero), oro (compite con tasas altas) y bonos del Tesoro.",
+    }),
+    (("core cpi", "core consumer price index"), {
+        "es": "IPC subyacente (Core CPI)",
+        "explica": "Mide la inflación al consumidor SIN incluir alimentos y energía (que son muy volátiles), por eso la Fed le presta mucha atención.",
+        "usd": "Si sale MÁS ALTO de lo esperado (más inflación), suele fortalecer al USD porque aumenta la probabilidad de que la Fed mantenga tasas altas. Si sale MÁS BAJO, suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y oro son los más sensibles; también mueve fuerte los bonos del Tesoro.",
+    }),
+    (("cpi", "consumer price index"), {
+        "es": "Índice de Precios al Consumidor (IPC)",
+        "explica": "Mide cuánto subieron los precios de una canasta de bienes y servicios que compran los consumidores; es el termómetro de inflación más seguido.",
+        "usd": "Si sale MÁS ALTO de lo esperado, suele fortalecer al USD (más probabilidad de tasas altas por más tiempo). Si sale MÁS BAJO, suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y oro son los más sensibles; también mueve fuerte los bonos del Tesoro.",
+    }),
+    (("core ppi", "core producer price index"), {
+        "es": "IPP subyacente (Core PPI)",
+        "explica": "Mide la inflación a nivel de productores/mayoristas, sin alimentos ni energía. Suele anticipar hacia dónde va el IPC del consumidor.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y materias primas.",
+    }),
+    (("ppi", "producer price index"), {
+        "es": "Índice de Precios al Productor (IPP)",
+        "explica": "Mide cuánto suben los precios que reciben los productores por sus bienes y servicios; es un indicador de inflación \"mayorista\", antes de llegar al consumidor.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y materias primas.",
+    }),
+    (("core pce",), {
+        "es": "PCE subyacente (indicador de inflación preferido de la Fed)",
+        "explica": "Mide la inflación del gasto personal sin alimentos ni energía. Es el indicador de inflación que la propia Reserva Federal usa como referencia principal.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo (a veces con más fuerza que el CPI, por ser el favorito de la Fed).",
+        "afecta": "NAS100/tecnológicas, oro y bonos del Tesoro.",
+    }),
+    (("pce price index", "pce"), {
+        "es": "Índice de precios PCE",
+        "explica": "Mide la inflación del gasto personal de los consumidores; junto con su versión \"subyacente\", es el indicador de inflación preferido de la Fed.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas, oro y bonos del Tesoro.",
+    }),
+    (("non-farm payrolls", "nonfarm payrolls", "non farm payrolls"), {
+        "es": "Nómina no agrícola (NFP)",
+        "explica": "Mide cuántos empleos nuevos se crearon en EE.UU. (fuera del sector agrícola) el mes anterior. Es de los datos más vigilados del mes por su impacto en todos los mercados.",
+        "usd": "Más empleos de los esperados suele fortalecer al USD (economía fuerte → Fed puede mantener tasas altas). Menos empleos de los esperados suele debilitarlo.",
+        "afecta": "Prácticamente todo el mercado se mueve fuerte: NAS100, S&P500, oro y bonos del Tesoro.",
+    }),
+    (("adp",), {
+        "es": "Empleo privado ADP",
+        "explica": "Mide el cambio en el empleo del sector privado según la firma de nómina ADP; suele publicarse un par de días antes del NFP oficial y da una pista de cómo vendrá.",
+        "usd": "Más empleos de los esperados suele fortalecer al USD; menos, debilitarlo (aunque con menos impacto que el NFP oficial).",
+        "afecta": "NAS100, S&P500 y en menor medida el oro.",
+    }),
+    (("jolts",), {
+        "es": "Vacantes de empleo JOLTS",
+        "explica": "Mide cuántas posiciones de trabajo estaban abiertas (sin cubrir) en EE.UU.; refleja qué tan fuerte está la demanda de trabajadores.",
+        "usd": "Más vacantes de las esperadas (mercado laboral fuerte) suele fortalecer al USD; menos vacantes suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y bonos del Tesoro.",
+    }),
+    (("continuing jobless claims", "continuing claims"), {
+        "es": "Solicitudes continuas de desempleo",
+        "explica": "Mide cuánta gente sigue recibiendo el seguro de desempleo semana tras semana; indica qué tan rápido (o lento) están encontrando trabajo los desempleados.",
+        "usd": "Menos solicitudes de las esperadas (mercado laboral fuerte) suele fortalecer al USD; más solicitudes suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y bonos del Tesoro.",
+    }),
+    (("initial jobless claims", "initial claims", "unemployment claims"), {
+        "es": "Solicitudes iniciales de desempleo",
+        "explica": "Mide cuánta gente pidió el seguro de desempleo por primera vez en la última semana; es uno de los datos de empleo más frecuentes (sale cada jueves).",
+        "usd": "Menos solicitudes de las esperadas (mercado laboral fuerte) suele fortalecer al USD; más solicitudes suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y bonos del Tesoro.",
+    }),
+    (("unemployment rate",), {
+        "es": "Tasa de desempleo",
+        "explica": "Porcentaje de la fuerza laboral que está sin trabajo pero buscando activamente uno. Es uno de los dos mandatos oficiales de la Fed (junto con la inflación).",
+        "usd": "Una tasa MÁS BAJA de lo esperado (mercado laboral fuerte) suele fortalecer al USD; una tasa MÁS ALTA suele debilitarlo.",
+        "afecta": "NAS100, S&P500 y bonos del Tesoro.",
+    }),
+    (("average hourly earnings",), {
+        "es": "Ingreso promedio por hora",
+        "explica": "Mide cuánto crecieron los salarios promedio; salarios que suben rápido pueden alimentar la inflación.",
+        "usd": "Crecimiento salarial MÁS ALTO de lo esperado suele fortalecer al USD (presión inflacionaria); MÁS BAJO suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y bonos del Tesoro.",
+    }),
+    (("gdp",), {
+        "es": "Producto Interno Bruto (PIB)",
+        "explica": "Mide el valor total de todo lo que produce la economía de EE.UU.; es el termómetro general de crecimiento económico.",
+        "usd": "Crecimiento MÁS ALTO de lo esperado suele fortalecer al USD; MÁS BAJO (o negativo) suele debilitarlo.",
+        "afecta": "S&P500, NAS100 y el USD en general frente a otras divisas.",
+    }),
+    (("core retail sales",), {
+        "es": "Ventas minoristas subyacentes",
+        "explica": "Mide las ventas minoristas sin contar autos (que son muy volátiles); refleja el consumo real del día a día.",
+        "usd": "Más ventas de las esperadas suele fortalecer al USD (consumo fuerte); menos ventas suele debilitarlo.",
+        "afecta": "S&P500 (sector consumo) y NAS100.",
+    }),
+    (("retail sales",), {
+        "es": "Ventas minoristas",
+        "explica": "Mide cuánto gastaron los consumidores en tiendas, restaurantes y online; el consumo es el motor más grande de la economía de EE.UU.",
+        "usd": "Más ventas de las esperadas suele fortalecer al USD (consumo fuerte); menos ventas suele debilitarlo.",
+        "afecta": "S&P500 (sector consumo) y NAS100.",
+    }),
+    (("ism manufacturing", "manufacturing pmi"), {
+        "es": "PMI manufacturero (ISM)",
+        "explica": "Encuesta a gerentes de compra de fábricas; por encima de 50 significa que el sector manufacturero está creciendo, por debajo, que se está contrayendo.",
+        "usd": "Un dato MÁS ALTO de lo esperado (o por encima de 50) suele fortalecer al USD; MÁS BAJO suele debilitarlo.",
+        "afecta": "NAS100, S&P500 y materias primas industriales.",
+    }),
+    (("ism services", "ism non-manufacturing", "services pmi"), {
+        "es": "PMI de servicios (ISM)",
+        "explica": "Igual que el manufacturero pero para el sector servicios, que es la mayor parte de la economía de EE.UU. Por encima de 50 = expansión, por debajo = contracción.",
+        "usd": "Un dato MÁS ALTO de lo esperado suele fortalecer al USD; MÁS BAJO suele debilitarlo.",
+        "afecta": "NAS100 y S&P500.",
+    }),
+    (("housing starts",), {
+        "es": "Inicios de construcción de viviendas",
+        "explica": "Mide cuántas viviendas nuevas empezaron a construirse; es un buen termómetro de la salud del sector inmobiliario y de la confianza económica.",
+        "usd": "Más inicios de los esperados suele fortalecer al USD (economía fuerte); menos, debilitarlo.",
+        "afecta": "Constructoras/sector inmobiliario dentro del S&P500 y, en menor medida, el USD.",
+    }),
+    (("building permits",), {
+        "es": "Permisos de construcción",
+        "explica": "Mide cuántos permisos nuevos se aprobaron para construir viviendas; anticipa la construcción futura (antes de que arranquen las obras).",
+        "usd": "Más permisos de los esperados suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "Constructoras/sector inmobiliario dentro del S&P500.",
+    }),
+    (("existing home sales",), {
+        "es": "Venta de viviendas existentes",
+        "explica": "Mide cuántas casas ya construidas (de reventa) se vendieron; es la mayor parte del mercado inmobiliario de EE.UU.",
+        "usd": "Más ventas de las esperadas suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "Sector inmobiliario dentro del S&P500.",
+    }),
+    (("new home sales",), {
+        "es": "Venta de viviendas nuevas",
+        "explica": "Mide cuántas casas recién construidas se vendieron; más chico que el mercado de reventa pero muy seguido por reflejar directamente a las constructoras.",
+        "usd": "Más ventas de las esperadas suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "Constructoras dentro del S&P500.",
+    }),
+    (("core durable goods", "durable goods"), {
+        "es": "Pedidos de bienes duraderos",
+        "explica": "Mide los pedidos de fábrica de bienes que duran más de 3 años (autos, maquinaria, electrónica); refleja la inversión de las empresas.",
+        "usd": "Más pedidos de los esperados suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "Sector industrial del S&P500 y NAS100.",
+    }),
+    (("consumer confidence",), {
+        "es": "Confianza del consumidor (Conference Board)",
+        "explica": "Encuesta que mide qué tan optimistas están los consumidores sobre la economía y sus finanzas; más confianza suele traducirse en más gasto.",
+        "usd": "Más confianza de la esperada suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "S&P500 (sector consumo) y NAS100.",
+    }),
+    (("michigan consumer sentiment", "consumer sentiment"), {
+        "es": "Sentimiento del consumidor de Michigan",
+        "explica": "Otra encuesta de confianza del consumidor, de la Universidad de Michigan, muy seguida junto con sus expectativas de inflación.",
+        "usd": "Más optimismo del esperado suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "S&P500 (sector consumo) y NAS100.",
+    }),
+    (("industrial production",), {
+        "es": "Producción industrial",
+        "explica": "Mide cuánto produjeron las fábricas, minas y plantas de energía de EE.UU.; refleja la salud del sector industrial.",
+        "usd": "Más producción de la esperada suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "Sector industrial del S&P500.",
+    }),
+    (("capacity utilization",), {
+        "es": "Utilización de capacidad industrial",
+        "explica": "Mide qué porcentaje de la capacidad total de las fábricas se está usando; muy alto puede señalar presión inflacionaria futura.",
+        "usd": "Más utilización de la esperada suele fortalecer al USD; menos, debilitarlo.",
+        "afecta": "Sector industrial del S&P500.",
+    }),
+    (("trade balance",), {
+        "es": "Balanza comercial",
+        "explica": "Mide la diferencia entre lo que EE.UU. exporta e importa; un déficit grande puede pesar sobre el USD a largo plazo.",
+        "usd": "Un déficit MÁS CHICO de lo esperado suele fortalecer al USD; uno MÁS GRANDE suele debilitarlo.",
+        "afecta": "Sectores exportadores del S&P500 y el USD frente a otras divisas.",
+    }),
+    (("empire state manufacturing",), {
+        "es": "Índice manufacturero Empire State (Fed de NY)",
+        "explica": "Encuesta a fábricas del distrito de Nueva York; suele ser de los primeros datos manufactureros del mes.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo.",
+        "afecta": "NAS100 y sector industrial del S&P500.",
+    }),
+    (("philadelphia fed", "philly fed"), {
+        "es": "Índice manufacturero de la Fed de Filadelfia",
+        "explica": "Encuesta a fábricas del distrito de Filadelfia; otro adelanto regional de cómo viene el sector manufacturero.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo.",
+        "afecta": "NAS100 y sector industrial del S&P500.",
+    }),
+    (("chicago pmi",), {
+        "es": "PMI de Chicago",
+        "explica": "Encuesta manufacturera regional de Chicago, seguida como adelanto del ISM manufacturero nacional.",
+        "usd": "Más alto de lo esperado suele fortalecer al USD; más bajo suele debilitarlo.",
+        "afecta": "NAS100 y S&P500.",
+    }),
+    (("nahb", "housing market index"), {
+        "es": "Índice del mercado de vivienda (NAHB)",
+        "explica": "Encuesta a constructoras sobre qué tan buenas ven las condiciones para vender casas nuevas; por encima de 50 es optimismo.",
+        "usd": "Más alto de lo esperado suele fortalecer levemente al USD; más bajo suele debilitarlo.",
+        "afecta": "Constructoras dentro del S&P500.",
+    }),
+    (("beige book",), {
+        "es": "Libro Beige de la Fed",
+        "explica": "Resumen cualitativo (no números duros) de las condiciones económicas en cada región de la Fed, publicado antes de cada reunión del FOMC.",
+        "usd": "Un tono más fuerte de lo esperado sobre la economía suele fortalecer al USD; un tono más débil suele debilitarlo.",
+        "afecta": "NAS100/tecnológicas y bonos del Tesoro.",
+    }),
+    (("powell speaks", "fed chair speech", "powell speech"), {
+        "es": "Discurso del presidente de la Fed (Powell)",
+        "explica": "Powell habla en público sobre la economía y la política monetaria; el mercado analiza cada palabra buscando pistas sobre el próximo movimiento de tasas.",
+        "usd": "Tono \"hawkish\" (duro) fortalece al USD; tono \"dovish\" (flexible) lo debilita.",
+        "afecta": "Todo el mercado: NAS100/tecnológicas, oro y bonos del Tesoro.",
+    }),
+]
+
+
+def _normalizar_titulo_evento(titulo):
+    t = (titulo or "").lower()
+    for token in ("(mom)", "(qoq)", "(yoy)", "m/m", "q/q", "y/y", "(m/m)", "(q/q)", "(y/y)"):
+        t = t.replace(token, " ")
+    return " ".join(t.split())
+
+
+def buscar_info_indicador(titulo):
+    """Busca en DICCIONARIO_INDICADORES la ficha (nombre en español + explicación) de un evento."""
+    t = _normalizar_titulo_evento(titulo)
+    for claves, info in DICCIONARIO_INDICADORES:
+        if any(clave in t for clave in claves):
+            return info
+    return None
+
+
+def _formatear_linea_evento(evento):
+    try:
+        hora_utc = datetime.strptime(evento["date"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=pytz.utc)
+        hora_ny = hora_utc.astimezone(NY_TZ).strftime("%H:%M")
+    except Exception:
+        hora_ny = "?"
+
+    titulo_original = evento.get("title") or evento.get("indicator") or "Evento económico"
+    info = buscar_info_indicador(titulo_original)
+    nombre = info["es"] if info else titulo_original
+
+    actual = evento.get("actual")
+    pronostico = evento.get("forecast")
+    previo = evento.get("previous")
+
+    extras = []
+    if pronostico not in (None, ""):
+        extras.append(f"pronóstico: {pronostico}")
+    if previo not in (None, ""):
+        extras.append(f"previo: {previo}")
+    extra_txt = f" ({', '.join(extras)})" if extras else ""
+
+    if actual not in (None, ""):
+        flecha = ""
+        try:
+            if pronostico not in (None, "") and float(actual) > float(pronostico):
+                flecha = " ⬆️"
+            elif pronostico not in (None, "") and float(actual) < float(pronostico):
+                flecha = " ⬇️"
+            else:
+                flecha = " ➡️"
+        except (TypeError, ValueError):
+            pass
+        return f"🔴 {hora_ny} NY — {nombre}: Real {actual}{flecha}{extra_txt}"
+
+    return f"🔴 {hora_ny} NY — {nombre}{extra_txt}"
+
 
 def obtener_calendario_economico():
     """
-    Consulta el calendario económico público de TradingView y devuelve los
-    eventos de ALTO impacto (ej. FOMC, CPI, NFP) programados para hoy.
+    Consulta el calendario económico público de TradingView y devuelve
+    (texto, eventos) con los eventos de ALTO impacto (ej. FOMC, CPI, NFP)
+    programados para hoy, traducidos/explicados con DICCIONARIO_INDICADORES.
+    `eventos` se guarda aparte para poder construir los botones "ℹ️" y
+    para poder volver a llamar a esta función más tarde y ver si ya salió
+    el dato "Real".
 
     Nota: este es el endpoint no-oficial que usa el propio widget de
     TradingView (economic-calendar.tradingview.com), no hay API key de
@@ -1096,34 +1394,73 @@ def obtener_calendario_economico():
         eventos = resp.json().get("result", [])
     except Exception:
         logger.exception("No se pudo obtener el calendario económico de TradingView")
-        return None
+        return None, []
 
     # importance en TradingView: 1 = alto impacto, 0 = medio, -1 = bajo.
     alto_impacto = [e for e in eventos if (e.get("importance") or 0) >= 1]
     if not alto_impacto:
-        return "🗞️ Calendario económico de hoy\n\nNo hay eventos de alto impacto programados en EE.UU. para hoy."
+        return "🗞️ Calendario económico de hoy\n\nNo hay eventos de alto impacto programados en EE.UU. para hoy.", []
 
     alto_impacto.sort(key=lambda e: e.get("date", ""))
-    lineas = []
-    for e in alto_impacto:
-        try:
-            hora_utc = datetime.strptime(e["date"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=pytz.utc)
-            hora_ny = hora_utc.astimezone(NY_TZ).strftime("%H:%M")
-        except Exception:
-            hora_ny = "?"
+    lineas = [_formatear_linea_evento(e) for e in alto_impacto]
 
-        titulo = e.get("title") or e.get("indicator") or "Evento económico"
-        pronostico = e.get("forecast")
-        previo = e.get("previous")
-        extras = []
-        if pronostico not in (None, ""):
-            extras.append(f"pronóstico: {pronostico}")
-        if previo not in (None, ""):
-            extras.append(f"previo: {previo}")
-        extra_txt = f" ({', '.join(extras)})" if extras else ""
-        lineas.append(f"🔴 {hora_ny} NY — {titulo}{extra_txt}")
+    texto = (
+        "🗞️ Calendario económico de hoy — eventos de alto impacto (EE.UU.)\n\n"
+        + "\n".join(lineas)
+        + "\n\nToca el botón ℹ️ de cada evento para ver qué es, cómo afecta al USD y qué se vería más afectado."
+    )
+    return texto, alto_impacto
 
-    return "🗞️ Calendario económico de hoy — eventos de alto impacto (EE.UU.)\n\n" + "\n".join(lineas)
+
+def construir_teclado_noticias(eventos):
+    if not eventos:
+        return None
+    filas, fila_actual = [], []
+    for i, evento in enumerate(eventos):
+        titulo_original = evento.get("title") or evento.get("indicator") or "Evento"
+        info = buscar_info_indicador(titulo_original)
+        etiqueta = (info["es"] if info else titulo_original)[:22]
+        fila_actual.append(InlineKeyboardButton(f"ℹ️ {etiqueta}", callback_data=f"newsinfo_{i}"))
+        if len(fila_actual) == 2:
+            filas.append(fila_actual)
+            fila_actual = []
+    if fila_actual:
+        filas.append(fila_actual)
+    return InlineKeyboardMarkup(filas)
+
+
+async def boton_info_noticia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        idx = int(query.data.replace("newsinfo_", ""))
+        evento = context.bot_data.get("news_events", [])[idx]
+    except (ValueError, IndexError, TypeError):
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="No encontré información de ese evento (el calendario pudo haberse actualizado). Prueba /noticias de nuevo.",
+        )
+        return
+
+    titulo_original = evento.get("title") or evento.get("indicator") or "Evento económico"
+    info = buscar_info_indicador(titulo_original)
+    if info:
+        texto = (
+            f"ℹ️ {info['es']}\n({titulo_original})\n\n"
+            f"📖 ¿Qué es?\n{info['explica']}\n\n"
+            f"💵 Impacto típico en el USD\n{info['usd']}\n\n"
+            f"📊 Qué suele verse más afectado\n{info['afecta']}"
+        )
+    else:
+        texto = (
+            f"ℹ️ {titulo_original}\n\n"
+            "Todavía no tengo una ficha detallada para este indicador en particular, pero como regla general "
+            "de mercado: si un dato económico de EE.UU. sale MEJOR de lo esperado, suele fortalecer al dólar "
+            "(USD) y presionar a la baja las acciones (sobre todo tecnológicas, sensibles a tasas) y el oro; "
+            "si sale PEOR de lo esperado, generalmente ocurre lo contrario. El impacto real siempre depende "
+            "también de qué tan sorpresivo sea el dato frente a lo que el mercado ya esperaba."
+        )
+    await context.bot.send_message(chat_id=query.message.chat_id, text=texto)
 
 
 # ══════════════════════════════════════════════════════════
@@ -1140,18 +1477,47 @@ async def saludo_lunes(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(chat_id=CHAT_ID, text=mensaje)
 
 
+NOTICIAS_HORA_CORTE = time(20, 0)  # después de esta hora NY dejamos de refrescar el mensaje de noticias
+
+
+async def actualizar_noticias(context: ContextTypes.DEFAULT_TYPE):
+    """Refresca (editando el mismo mensaje) el calendario para que aparezcan los datos 'Real' a medida que salen."""
+    ahora_ny = datetime.now(NY_TZ)
+    if not es_dia_habil() or ahora_ny.time() >= NOTICIAS_HORA_CORTE:
+        context.job.schedule_removal()
+        return
+
+    texto, eventos = obtener_calendario_economico()
+    if not texto:
+        return  # falló la consulta a TradingView; se reintenta en el próximo ciclo
+    context.bot_data["news_events"] = eventos
+    await _editar_o_enviar_mensaje(
+        context.bot, context.bot_data, CHAT_ID, "news_msg", texto,
+        reply_markup=construir_teclado_noticias(eventos),
+    )
+
+
 async def mensaje_matutino(context: ContextTypes.DEFAULT_TYPE):
     """
     Se ejecuta de lunes a viernes a las 7:00 NY. El calendario económico
     (FOMC, CPI, NFP, etc.) es siempre el PRIMER mensaje del día; los lunes,
     justo después, se manda el saludo semanal y se reinicia la semana.
+    Luego queda un job corriendo el resto del día que va editando este
+    mismo mensaje para mostrar el dato "Real" apenas se publica.
     """
     if not es_dia_habil():
         return
 
-    calendario = obtener_calendario_economico()
-    if calendario:
-        await context.bot.send_message(chat_id=CHAT_ID, text=calendario)
+    # Mensaje nuevo cada día (no editamos el de ayer).
+    context.bot_data.pop("news_msg", None)
+
+    texto, eventos = obtener_calendario_economico()
+    if texto:
+        context.bot_data["news_events"] = eventos
+        msg = await context.bot.send_message(
+            chat_id=CHAT_ID, text=texto, reply_markup=construir_teclado_noticias(eventos)
+        )
+        context.bot_data["news_msg"] = msg.message_id
     else:
         await context.bot.send_message(
             chat_id=CHAT_ID,
@@ -1160,6 +1526,13 @@ async def mensaje_matutino(context: ContextTypes.DEFAULT_TYPE):
                 "Revisa manualmente si hay datos de alto impacto (FOMC, CPI, NFP, etc.)."
             ),
         )
+
+    # Refresca el mismo mensaje durante el día para ir mostrando los "Real".
+    for job in context.job_queue.get_jobs_by_name("noticias_refresh"):
+        job.schedule_removal()
+    context.job_queue.run_repeating(
+        actualizar_noticias, interval=900, first=900, name="noticias_refresh"
+    )
 
     if datetime.now(NY_TZ).weekday() == 0:  # lunes
         await saludo_lunes(context)
@@ -1417,9 +1790,11 @@ async def comando_tecnico(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def comando_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    calendario = obtener_calendario_economico()
+    texto, eventos = obtener_calendario_economico()
+    context.bot_data["news_events"] = eventos
     await update.message.reply_text(
-        calendario or "No pude obtener el calendario económico de TradingView en este momento."
+        texto or "No pude obtener el calendario económico de TradingView en este momento.",
+        reply_markup=construir_teclado_noticias(eventos),
     )
 
 
@@ -1610,6 +1985,7 @@ def main():
     app.add_handler(CallbackQueryHandler(boton_ayuda, pattern="^ayuda$"))
     app.add_handler(CallbackQueryHandler(boton_restore_confirm, pattern="^restore_confirm_"))
     app.add_handler(CallbackQueryHandler(boton_restore_cancel, pattern="^restore_cancel$"))
+    app.add_handler(CallbackQueryHandler(boton_info_noticia, pattern="^newsinfo_"))
 
     # Mensajes
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje_texto))
